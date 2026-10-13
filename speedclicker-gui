@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+Speed AutoClicker clone for Omarchy (Arch + Hyprland / Wayland)
+
+- Global activation key: any keyboard key OR mouse button (default XButton2),
+  read straight from /dev/input via python-evdev (works on Wayland).
+- Activation mode: hold (click while held) or toggle.
+- Clicks are injected through a virtual mouse (/dev/uinput).
+- Click rate, random, unlimited, duty cycle, click limit, per-app filter.
+
+Closing the window (or OK) hides it but keeps the clicker running.
+Run the program again to bring the window back. EXIT quits.
+"""
+import json
+import os
+import queue
+import random
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+
+try:
+    from evdev import InputDevice, UInput, ecodes as e, list_devices
+except ImportError:
+    sys.exit("python-evdev is missing:  sudo pacman -S python-evdev tk")
+
+APP = "speedclicker"
+SELF = os.path.abspath(__file__)
+CFG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+CFG_FILE = CFG_DIR / "config.json"
+PIDFILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"{APP}-gui.pid"
+AUTOSTART = Path.home() / ".config" / "hypr" / "autostart.conf"
+AUTOSTART_MARK = "# speedclicker-autostart"
+
+BUTTONS = {"left": e.BTN_LEFT, "right": e.BTN_RIGHT, "middle": e.BTN_MIDDLE}
+
+# Windows naming: XButton1 = back, XButton2 = forward  (Linux: BTN_SIDE / BTN_EXTRA)
+MOUSE_NAMES = {
+    e.BTN_LEFT: "LButton", e.BTN_RIGHT: "RButton", e.BTN_MIDDLE: "MButton",
+    e.BTN_SIDE: "XButton1", e.BTN_EXTRA: "XButton2",
+    e.BTN_FORWARD: "Forward", e.BTN_BACK: "Back", e.BTN_TASK: "Task",
+}
+
+DEFAULTS = {
+    "keys": [e.BTN_EXTRA],
+    "mode": "hold",
+    "button": "left",
+    "cps": 20.0,
+    "unlimited": False,
+    "random": False,
+    "duty": 50.0,
+    "limit_on": False,
+    "limit": 100,
+    "apps": [],
+    "block_key": True,
+    "double": False,
+    "delay": 0,
+}
+
+
+# ----------------------------------------------------------------- helpers
+def is_mouse_btn(code):
+    return 0x110 <= code < 0x120
+
+
+def key_name(code):
+    if code in MOUSE_NAMES:
+        return MOUSE_NAMES[code]
+    n = e.bytype[e.EV_KEY].get(code, str(code))
+    if isinstance(n, (list, tuple)):
+        n = n[0]
+    return n.replace("KEY_", "").replace("BTN_", "").title()
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CFG_FILE.read_text()))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+        CFG_FILE.write_text(json.dumps(cfg, indent=2))
+    except OSError:
+        pass
+
+
+def timing(c, jitter=False):
+    """Return (click_down_seconds, wait_seconds) for the current settings."""
+    if c["unlimited"]:
+        return 0.0005, 0.0005
+    period = 1.0 / max(c["cps"], 0.01)
+    if jitter and c["random"]:
+        period *= random.uniform(0.75, 1.25)
+    down = period * c["duty"] / 100.0
+    return down, period - down
+
+
+def autostart_enabled():
+    try:
+        return AUTOSTART_MARK in AUTOSTART.read_text()
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    try:
+        lines = AUTOSTART.read_text().splitlines() if AUTOSTART.exists() else []
+    except OSError:
+        return
+    out, skip = [], False
+    for ln in lines:
+        if skip:
+            skip = False
+            continue
+        if ln.strip() == AUTOSTART_MARK:
+            skip = True
+            continue
+        out.append(ln)
+    if on:
+        out += [AUTOSTART_MARK, f"exec-once = {sys.executable} {SELF} --hidden"]
+    AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+    AUTOSTART.write_text("\n".join(out) + "\n")
+
+
+def hypr_classes():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                             text=True, timeout=2).stdout
+        return sorted({c.get("class", "") for c in json.loads(out) if c.get("class")})
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------------ engine
+class Engine:
+    def __init__(self, cfg, q):
+        self.cfg = cfg
+        self.q = q
+        self.active = threading.Event()
+        self.quit = threading.Event()
+        self.held = set()
+        self.capture_cb = None
+        self.out = None
+        self.out_error = None
+        self.perm_denied = False
+        self.rescan = False
+        self.count = 0
+        self._fc = ("", 0.0)
+
+    # ---- lifecycle
+    def start(self):
+        try:
+            self.out = UInput(
+                {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                 e.EV_REL: [e.REL_X, e.REL_Y]},
+                name=f"{APP}-virtual")
+        except Exception as ex:  # PermissionError, or UInputError if uinput isn't loaded
+            self.out_error = str(ex)
+        threading.Thread(target=self.listen, daemon=True).start()
+        threading.Thread(target=self.click_loop, daemon=True).start()
+
+    def shutdown(self):
+        self.active.clear()
+        self.quit.set()
+        time.sleep(0.25)
+
+    # ---- input listening
+    def scan(self, devs):
+        known = {d.path for d, _ in devs.values()}
+        mouse_keys = {k for k in self.cfg["keys"] if is_mouse_btn(k)}
+        for path in list_devices():
+            if path in known:
+                continue
+            try:
+                dev = InputDevice(path)
+            except PermissionError:
+                self.perm_denied = True
+                continue
+            except OSError:
+                continue
+            caps = dev.capabilities()
+            if dev.name.startswith(APP) or e.EV_KEY not in caps:
+                dev.close()
+                continue
+            fwd = None
+            # Swallow the activation button so it doesn't also trigger "back/forward"
+            # in other apps: grab the mouse and re-emit everything except that button.
+            if (self.cfg["block_key"] and e.EV_REL in caps
+                    and mouse_keys & set(caps[e.EV_KEY])):
+                try:
+                    fwd = UInput.from_device(dev, name=f"{APP}-fwd")
+                    dev.grab()
+                except Exception:
+                    if fwd:
+                        fwd.close()
+                    fwd = None
+            devs[dev.fd] = (dev, fwd)
+        if devs:
+            self.perm_denied = False
+
+    @staticmethod
+    def close_dev(dev, fwd):
+        try:
+            dev.ungrab()
+        except Exception:
+            pass
+        try:
+            if fwd:
+                fwd.close()
+            dev.close()
+        except Exception:
+            pass
+
+    def listen(self):
+        devs = {}
+        last_scan = 0.0
+        try:
+            while not self.quit.is_set():
+                if self.rescan:
+                    for d, f in devs.values():
+                        self.close_dev(d, f)
+                    devs.clear()
+                    self.rescan = False
+                    last_scan = 0.0
+                if time.time() - last_scan > 3:
+                    self.scan(devs)
+                    last_scan = time.time()
+                if not devs:
+                    time.sleep(0.5)
+                    continue
+                ready, _, _ = select.select(list(devs.keys()), [], [], 0.3)
+                for fd in ready:
+                    dev, fwd = devs[fd]
+                    try:
+                        for ev in dev.read():
+                            self.handle(ev, fwd)
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        self.close_dev(dev, fwd)
+                        devs.pop(fd, None)
+        finally:
+            for d, f in devs.values():
+                self.close_dev(d, f)
+
+    def handle(self, ev, fwd):
+        if ev.type == e.EV_KEY:
+            if self.capture_cb and ev.value == 1:
+                cb, self.capture_cb = self.capture_cb, None
+                cb(ev.code)
+                return
+            if ev.code in self.cfg["keys"]:
+                if ev.value == 1:
+                    self.on_press(ev.code)
+                elif ev.value == 0:
+                    self.on_release(ev.code)
+                if fwd and is_mouse_btn(ev.code):
+                    return  # swallowed
+                return
+        if fwd:
+            fwd.write_event(ev)
+
+    def on_press(self, code):
+        if self.cfg["mode"] == "toggle":
+            if self.active.is_set():
+                self.active.clear()
+            else:
+                self.active.set()
+        else:
+            self.held.add(code)
+            self.active.set()
+
+    def on_release(self, code):
+        if self.cfg["mode"] == "hold":
+            self.held.discard(code)
+            if not self.held:
+                self.active.clear()
+
+    # ---- clicking
+    def sleep_until(self, t):
+        while self.active.is_set():
+            r = t - time.perf_counter()
+            if r <= 0:
+                return
+            if r > 0.002:
+                time.sleep(r - 0.0012)
+            else:
+                time.sleep(0)  # spin the last couple of ms for accuracy
+
+    def focused_class(self):
+        now = time.monotonic()
+        if now - self._fc[1] > 0.15:
+            cls = ""
+            try:
+                out = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                     capture_output=True, text=True, timeout=1).stdout
+                cls = (json.loads(out).get("class") or "") if out.strip() else ""
+            except Exception:
+                pass
+            self._fc = (cls, now)
+        return self._fc[0]
+
+    def app_ok(self):
+        apps = self.cfg["apps"]
+        if not apps:
+            return True
+        return self.focused_class().lower() in {a.lower() for a in apps}
+
+    def click_loop(self):
+        while not self.quit.is_set():
+            if not self.active.wait(0.2):
+                continue
+            self.run_burst()
+
+    def run_burst(self):
+        if not self.out:
+            self.active.clear()
+            return
+        c = self.cfg
+        self.count = 0
+        if c["delay"] > 0:
+            self.sleep_until(time.perf_counter() + c["delay"] / 1000.0)
+        t = time.perf_counter()
+        while self.active.is_set() and not self.quit.is_set():
+            if not self.app_ok():
+                time.sleep(0.05)
+                t = time.perf_counter()
+                continue
+            btn = BUTTONS[c["button"]]
+            taps = 2 if c["double"] else 1
+            down, up = timing(c, jitter=True)
+            for _ in range(taps):
+                self.out.write(e.EV_KEY, btn, 1)
+                self.out.syn()
+                try:
+                    t += down / taps
+                    self.sleep_until(t)
+                finally:
+                    self.out.write(e.EV_KEY, btn, 0)
+                    self.out.syn()
+                t += up / taps
+                self.sleep_until(t)
+            self.count += 1
+            if c["limit_on"] and self.count >= c["limit"]:
+                self.active.clear()
+                break
+            if time.perf_counter() - t > 0.1:  # fell behind: don't burst to catch up
+                t = time.perf_counter()
+
+
+# --------------------------------------------------------------------- GUI
+BG = "#f0f0f0"
+BLUE = "#3a8ede"
+BLUE_D = "#2f7bc6"
+PINK = "#f1a3a3"
+FONT = ("Sans", 10)
+FONT_B = ("Sans", 10, "bold")
+FONT_S = ("Sans", 9, "bold")
+
+
+def blue_btn(parent, text, cmd, **kw):
+    return tk.Button(parent, text=text, command=cmd, bg=BLUE, fg="white",
+                     activebackground=BLUE_D, activeforeground="white",
+                     relief="flat", bd=0, font=FONT, cursor="hand2",
+                     highlightthickness=0, **kw)
+
+
+class App:
+    def __init__(self, hidden=False):
+        self.cfg = load_config()
+        self.q = queue.Queue()
+        self.engine = Engine(self.cfg, self.q)
+        self.show_req = False
+        self.loading = True
+        self.save_job = None
+        self.cap_top = None
+
+        r = self.root = tk.Tk(className=APP)
+        r.title("Speed AutoClicker")
+        r.configure(bg=BG)
+        r.resizable(False, False)
+        try:
+            r.attributes("-type", "dialog")  # makes Hyprland float it
+        except tk.TclError:
+            pass
+        r.protocol("WM_DELETE_WINDOW", self.hide)
+
+        self.build_vars()
+        self.build_activation()
+        self.build_clicks()
+        self.build_rate_limit()
+        self.build_misc()
+        self.build_bottom()
+
+        self.loading = False
+        self.sync()
+
+        signal.signal(signal.SIGUSR1, lambda *_: setattr(self, "show_req", True))
+        self.engine.start()
+        if self.engine.out_error:
+            self.status.config(text="No access to /dev/uinput - see setup", fg="#c0392b")
+        r.after(60, self.poll)
+        if hidden:
+            r.withdraw()
+
+    # ---- variables
+    def build_vars(self):
+        c = self.cfg
+        self.v_mode = tk.StringVar(value=c["mode"])
+        self.v_button = tk.StringVar(value=c["button"])
+        self.v_cps = tk.StringVar(value=f"{c['cps']:.2f}")
+        self.v_unl = tk.BooleanVar(value=c["unlimited"])
+        self.v_rand = tk.BooleanVar(value=c["random"])
+        self.v_duty = tk.StringVar(value=f"{c['duty']:.2f}")
+        self.v_lim_on = tk.BooleanVar(value=c["limit_on"])
+        self.v_lim = tk.StringVar(value=str(c["limit"]))
+        self.v_block = tk.BooleanVar(value=c["block_key"])
+        self.v_auto = tk.BooleanVar(value=autostart_enabled())
+        for v in (self.v_mode, self.v_button, self.v_cps, self.v_unl, self.v_rand,
+                  self.v_duty, self.v_lim_on, self.v_lim, self.v_block):
+            v.trace_add("write", lambda *_: self.sync())
+        self.v_auto.trace_add("write", lambda *_: set_autostart(self.v_auto.get()))
+
+    @staticmethod
+    def num(var, fallback, lo, hi, cast=float):
+        try:
+            return min(max(cast(float(var.get())), lo), hi)
+        except (ValueError, tk.TclError):
+            return fallback
+
+    def sync(self):
+        if self.loading:
+            return
+        c = self.cfg
+        c["mode"] = self.v_mode.get()
+        c["button"] = self.v_button.get()
+        c["cps"] = self.num(self.v_cps, c["cps"], 0.01, 1000)
+        c["unlimited"] = self.v_unl.get()
+        c["random"] = self.v_rand.get()
+        c["duty"] = self.num(self.v_duty, c["duty"], 0.1, 99.9)
+        c["limit_on"] = self.v_lim_on.get()
+        c["limit"] = self.num(self.v_lim, c["limit"], 1, 10**9, int)
+        block = self.v_block.get()
+        if block != c["block_key"]:
+            c["block_key"] = block
+            self.engine.rescan = True
+
+        self.cps_spin.config(state="disabled" if c["unlimited"] else "normal")
+        self.lim_spin.config(state="normal" if c["limit_on"] else "disabled")
+        self.lim_lbl.config(fg="black" if c["limit_on"] else "#888")
+        self.paint_mouse()
+        down, up = timing(c)
+        self.timing_lbl.config(text=f"Click / Wait: {down * 1000:.1f} ms / {up * 1000:.1f} ms")
+        self.key_lbl.config(text=" / ".join(key_name(k) for k in c["keys"]) or "none")
+        if self.save_job:
+            self.root.after_cancel(self.save_job)
+        self.save_job = self.root.after(400, lambda: save_config(self.cfg))
+
+    # ---- sections
+    def frame(self, text, **pack):
+        f = tk.LabelFrame(self.root, text=text, font=FONT, bg=BG, padx=8, pady=6)
+        f.pack(**pack)
+        return f
+
+    def build_activation(self):
+        f = self.frame("Activation", fill="x", padx=10, pady=(8, 0))
+        tk.Label(f, text="Activation Key:", font=FONT_B, bg=BG).grid(row=0, column=0, sticky="w", pady=4)
+        self.key_lbl = tk.Label(f, text="", font=FONT_B, bg="#e6e6e6", width=17, height=2)
+        self.key_lbl.grid(row=0, column=1, padx=8, pady=4)
+        blue_btn(f, "+", lambda: self.select_key(True), width=2, height=2).grid(row=0, column=2, padx=(0, 4))
+        blue_btn(f, "SELECT...", lambda: self.select_key(False), width=12, height=2).grid(row=0, column=3)
+
+        tk.Label(f, text="Activation Mode:", font=FONT_B, bg=BG).grid(row=1, column=0, sticky="w", pady=4)
+        mf = tk.Frame(f, bg=BG)
+        mf.grid(row=1, column=1, columnspan=2, sticky="w", padx=8)
+        for v in ("hold", "toggle"):
+            tk.Radiobutton(mf, text=v, variable=self.v_mode, value=v, bg=BG, font=FONT,
+                           activebackground=BG, highlightthickness=0).pack(side="left", padx=(0, 14))
+        blue_btn(f, "CHOOSE APPS", self.choose_apps, width=12, height=1).grid(row=1, column=3, pady=4)
+
+    def build_clicks(self):
+        f = self.frame("Clicks", fill="x", padx=10, pady=(8, 0))
+        area = tk.Frame(f, bg=BG, width=480, height=212)
+        area.pack()
+        area.pack_propagate(False)
+
+        def radio(text, val, **place):
+            tk.Radiobutton(area, text=text, variable=self.v_button, value=val, bg=BG, font=FONT,
+                           activebackground=BG, highlightthickness=0).place(**place)
+
+        radio("middle Mouse Button (Scroll Wheel)", "middle", relx=0.5, y=0, anchor="n")
+        tk.Label(area, text="MButton", font=FONT_S, bg=BG).place(relx=0.5, y=24, anchor="n")
+        radio("left Mouse Button", "left", x=4, y=84)
+        tk.Label(area, text="LButton", font=FONT_S, bg=BG).place(x=62, y=108)
+        radio("right Mouse Button", "right", x=318, y=84)
+        tk.Label(area, text="RButton", font=FONT_S, bg=BG).place(x=376, y=108)
+
+        cv = self.mouse = tk.Canvas(area, width=130, height=165, bg=BG, highlightthickness=0)
+        cv.place(x=175, y=40)
+        self.m_left = cv.create_arc(5, 5, 125, 160, start=90, extent=90, style="pieslice", outline="#777", width=1)
+        self.m_right = cv.create_arc(5, 5, 125, 160, start=0, extent=90, style="pieslice", outline="#777", width=1)
+        self.m_body = cv.create_arc(5, 5, 125, 160, start=180, extent=180, style="pieslice",
+                                    fill="#f7f7f7", outline="#777")
+        self.m_wheel = cv.create_oval(57, 18, 73, 60, outline="#555", width=1)
+        cv.create_oval(5, 5, 125, 160, outline="#666", width=2)
+        cv.create_line(65, 5, 65, 82, fill="#777")
+        for item, val in ((self.m_left, "left"), (self.m_right, "right"), (self.m_wheel, "middle")):
+            cv.tag_bind(item, "<Button-1>", lambda _e, v=val: self.v_button.set(v))
+
+        tk.Button(area, text="\u2699", command=self.gear, bg=BG, relief="flat", bd=0, font=("Sans", 20),
+                  activebackground=BG, highlightthickness=0, cursor="hand2").place(x=432, y=160)
+
+    def paint_mouse(self):
+        sel = self.v_button.get()
+        cv = self.mouse
+        cv.itemconfig(self.m_left, fill=PINK if sel == "left" else "#f7f7f7")
+        cv.itemconfig(self.m_right, fill=PINK if sel == "right" else "#f7f7f7")
+        cv.itemconfig(self.m_wheel, fill=PINK if sel == "middle" else "#aaaaaa")
+
+    def build_rate_limit(self):
+        row = tk.Frame(self.root, bg=BG)
+        row.pack(fill="x", padx=10, pady=(8, 0))
+
+        f = tk.LabelFrame(row, text="Click rate", font=FONT, bg=BG, padx=8, pady=6)
+        f.pack(side="left", fill="y")
+        r0 = tk.Frame(f, bg=BG)
+        r0.pack(anchor="w", pady=2)
+        self.cps_spin = tk.Spinbox(r0, from_=0.01, to=1000, increment=1, format="%.2f", width=7,
+                                   textvariable=self.v_cps, font=FONT)
+        self.cps_spin.pack(side="left")
+        tk.Label(r0, text="Clicks per second", font=FONT, bg=BG).pack(side="left", padx=6)
+        r1 = tk.Frame(f, bg=BG)
+        r1.pack(anchor="w", pady=2)
+        tk.Checkbutton(r1, text="unlimited", variable=self.v_unl, bg=BG, font=FONT,
+                       activebackground=BG, highlightthickness=0).pack(side="left", padx=(0, 18))
+        tk.Checkbutton(r1, text="random", variable=self.v_rand, bg=BG, font=FONT,
+                       activebackground=BG, highlightthickness=0).pack(side="left")
+        r2 = tk.Frame(f, bg=BG)
+        r2.pack(anchor="w", pady=(6, 2))
+        tk.Label(r2, text="Click duty cycle:", font=FONT, bg=BG).pack(side="left")
+        tk.Spinbox(r2, from_=0.1, to=99.9, increment=1, format="%.2f", width=7,
+                   textvariable=self.v_duty, font=FONT).pack(side="left", padx=6)
+        tk.Label(r2, text="%", font=FONT, bg=BG).pack(side="left")
+
+        right = tk.Frame(row, bg=BG)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        lf = tk.LabelFrame(right, text="Click limit", font=FONT, bg=BG, padx=8, pady=6)
+        lf.pack(fill="x")
+        tk.Checkbutton(lf, text="Enable Click Limit", variable=self.v_lim_on, bg=BG, font=FONT,
+                       activebackground=BG, highlightthickness=0).pack(anchor="w")
+        r = tk.Frame(lf, bg=BG)
+        r.pack(anchor="w", pady=(6, 2))
+        self.lim_lbl = tk.Label(r, text="Maximum", font=FONT, bg=BG)
+        self.lim_lbl.pack(side="left")
+        self.lim_spin = tk.Spinbox(r, from_=1, to=10**9, increment=1, width=6, textvariable=self.v_lim, font=FONT)
+        self.lim_spin.pack(side="left", padx=6)
+        tk.Label(r, text="Clicks", font=FONT, bg=BG).pack(side="left")
+        self.timing_lbl = tk.Label(right, text="", font=("Sans", 9), bg=BG)
+        self.timing_lbl.pack(pady=(8, 0))
+
+    def build_misc(self):
+        f = self.frame("Misc", fill="x", padx=10, pady=(8, 0))
+        left = tk.Frame(f, bg=BG)
+        left.pack(side="left")
+        tk.Checkbutton(left, text="Autostart on login (Hyprland)", variable=self.v_auto, bg=BG, font=FONT,
+                       activebackground=BG, highlightthickness=0).pack(anchor="w")
+        tk.Checkbutton(left, text="Block activation button in other apps", variable=self.v_block, bg=BG,
+                       font=FONT, activebackground=BG, highlightthickness=0).pack(anchor="w")
+        blue_btn(f, "RESET SETTINGS", self.reset, width=18, height=2).pack(side="right", padx=4)
+
+    def build_bottom(self):
+        f = tk.Frame(self.root, bg=BG)
+        f.pack(fill="x", padx=10, pady=12)
+        self.status = tk.Label(f, text="", font=FONT_B, bg=BG, anchor="w")
+        self.status.pack(side="left")
+        blue_btn(f, "EXIT", self.exit, width=10, height=2).pack(side="right")
+        blue_btn(f, "OK", self.hide, width=10, height=2).pack(side="right", padx=8)
+
+    # ---- dialogs
+    def select_key(self, add):
+        if self.cap_top:
+            return
+        top = self.cap_top = tk.Toplevel(self.root)
+        top.title("Select activation key")
+        top.configure(bg=BG, padx=24, pady=16)
+        top.transient(self.root)
+        tk.Label(top, text="Press any key or mouse button...\n(Esc to cancel)", font=FONT_B, bg=BG).pack(pady=8)
+        blue_btn(top, "Cancel", lambda: self.end_capture(None, add), width=10).pack()
+        top.protocol("WM_DELETE_WINDOW", lambda: self.end_capture(None, add))
+        self.engine.capture_cb = lambda code: self.q.put(("captured", (code, add)))
+
+    def end_capture(self, code, add):
+        self.engine.capture_cb = None
+        if self.cap_top:
+            self.cap_top.destroy()
+            self.cap_top = None
+        if code is None or code in (e.KEY_ESC, e.BTN_LEFT):
+            return
+        keys = self.cfg["keys"]
+        self.cfg["keys"] = (keys + [code] if code not in keys else keys) if add else [code]
+        self.engine.held.clear()
+        self.engine.rescan = True
+        self.sync()
+
+    def choose_apps(self):
+        top = tk.Toplevel(self.root)
+        top.title("Choose apps")
+        top.configure(bg=BG, padx=14, pady=10)
+        top.transient(self.root)
+        tk.Label(top, text="Only click while one of these apps is focused.\nSelect none = all apps.",
+                 font=FONT, bg=BG, justify="left").pack(anchor="w", pady=(0, 6))
+        box = tk.Frame(top, bg=BG)
+        box.pack(fill="x")
+        vars_ = {}
+
+        def add_row(cls, on):
+            if cls in vars_:
+                return
+            v = tk.BooleanVar(value=on)
+            tk.Checkbutton(box, text=cls, variable=v, bg=BG, font=FONT, anchor="w",
+                           activebackground=BG, highlightthickness=0).pack(fill="x")
+            vars_[cls] = v
+
+        for cls in sorted(set(hypr_classes()) | set(self.cfg["apps"]), key=str.lower):
+            add_row(cls, cls in self.cfg["apps"])
+
+        er = tk.Frame(top, bg=BG)
+        er.pack(fill="x", pady=8)
+        ent = tk.Entry(er, font=FONT)
+        ent.pack(side="left", fill="x", expand=True)
+        blue_btn(er, "Add class", lambda: (add_row(ent.get().strip(), True) if ent.get().strip() else None,
+                                           ent.delete(0, "end")), width=9).pack(side="left", padx=6)
+
+        def ok():
+            self.cfg["apps"] = [c for c, v in vars_.items() if v.get()]
+            save_config(self.cfg)
+            top.destroy()
+
+        blue_btn(top, "OK", ok, width=10, height=1).pack(anchor="e")
+
+    def gear(self):
+        top = tk.Toplevel(self.root)
+        top.title("Advanced")
+        top.configure(bg=BG, padx=16, pady=12)
+        top.transient(self.root)
+        v_dbl = tk.BooleanVar(value=self.cfg["double"])
+        v_delay = tk.StringVar(value=str(self.cfg["delay"]))
+        tk.Checkbutton(top, text="Double click", variable=v_dbl, bg=BG, font=FONT,
+                       activebackground=BG, highlightthickness=0).pack(anchor="w")
+        r = tk.Frame(top, bg=BG)
+        r.pack(anchor="w", pady=8)
+        tk.Label(r, text="Start delay:", font=FONT, bg=BG).pack(side="left")
+        tk.Spinbox(r, from_=0, to=10000, increment=50, width=6, textvariable=v_delay, font=FONT).pack(side="left", padx=6)
+        tk.Label(r, text="ms", font=FONT, bg=BG).pack(side="left")
+
+        def ok():
+            self.cfg["double"] = v_dbl.get()
+            self.cfg["delay"] = self.num(v_delay, 0, 0, 10000, int)
+            save_config(self.cfg)
+            top.destroy()
+
+        blue_btn(top, "OK", ok, width=10).pack(anchor="e")
+
+    def reset(self):
+        self.cfg.clear()
+        self.cfg.update(json.loads(json.dumps(DEFAULTS)))
+        c = self.cfg
+        self.loading = True
+        self.v_mode.set(c["mode"])
+        self.v_button.set(c["button"])
+        self.v_cps.set(f"{c['cps']:.2f}")
+        self.v_unl.set(c["unlimited"])
+        self.v_rand.set(c["random"])
+        self.v_duty.set(f"{c['duty']:.2f}")
+        self.v_lim_on.set(c["limit_on"])
+        self.v_lim.set(str(c["limit"]))
+        self.v_block.set(c["block_key"])
+        self.loading = False
+        self.engine.held.clear()
+        self.engine.rescan = True
+        self.sync()
+
+    # ---- window management
+    def hide(self):
+        self.root.withdraw()
+
+    def exit(self):
+        self.engine.shutdown()
+        save_config(self.cfg)
+        PIDFILE.unlink(missing_ok=True)
+        self.root.destroy()
+
+    def poll(self):
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "captured":
+                    self.end_capture(*val)
+        except queue.Empty:
+            pass
+        if self.show_req:
+            self.show_req = False
+            self.root.deiconify()
+            self.root.lift()
+        eng = self.engine
+        if eng.out_error:
+            pass
+        elif eng.perm_denied:
+            self.status.config(text="No access to /dev/input - join the 'input' group", fg="#c0392b")
+        elif eng.active.is_set():
+            self.status.config(text=f"\u25cf clicking ({eng.count})", fg="#1e8e3e")
+        else:
+            self.status.config(text="\u25cb ready", fg="#555")
+        self.root.after(60, self.poll)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def other_instance():
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        if pid != os.getpid() and APP in Path(f"/proc/{pid}/cmdline").read_text():
+            return pid
+    except Exception:
+        pass
+    return None
+
+
+def main():
+    pid = other_instance()
+    if pid:  # already running: just bring its window to the front
+        os.kill(pid, signal.SIGUSR1)
+        return
+    PIDFILE.write_text(str(os.getpid()))
+    App(hidden="--hidden" in sys.argv).run()
+
+
+if __name__ == "__main__":
+    main()

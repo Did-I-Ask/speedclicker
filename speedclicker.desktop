@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Speed AutoClicker
+Comment=Hold or toggle auto clicker
+Exec=@BIN@/speedclicker-gui
+Icon=input-mouse
+Type=Application
+Terminal=false
+Categories=Utility;
