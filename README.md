@@ -17,7 +17,7 @@ Works on Wayland by reading `/dev/input` (python-evdev) and clicking through a v
 
 ## Install
 ```bash
-git clone https://github.com/YOURNAME/speedclicker.git
+git clone https://github.com/Did-I-Ask/speedclicker.git
 cd speedclicker
 ./install.sh
 ```
